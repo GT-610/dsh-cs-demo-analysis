@@ -56,7 +56,11 @@ export class DemoParser {
     worker.on('message', (message: unknown) => this.#settle(message));
     worker.on('error', (error: Error) => this.#fail(error));
     worker.on('exit', (code: number) => {
-      if (this.#worker === worker) this.#worker = undefined;
+      // A superseded worker exits after the current one has already replaced
+      // it: counting that exit would charge one fault twice and would fail the
+      // requests that belong to the replacement.
+      if (this.#worker !== worker) return;
+      this.#worker = undefined;
       if (code !== 0) this.#fail(new Error(`demo parser worker exited with code ${code}`));
     });
     this.#worker = worker;
@@ -89,6 +93,27 @@ export class DemoParser {
   }
 
   /**
+   * Retire the worker without counting a fault.
+   *
+   * A synchronous native parse cannot be interrupted, so a request that timed
+   * out or was cancelled leaves its worker busy until that parse returns.
+   * Reusing the worker would park every later request behind the dead one in
+   * the message queue, where each would time out in turn. Dropping it fails
+   * the requests still queued on it with an explicit error and lets the next
+   * call start a fresh worker.
+   */
+  #retire(reason: string): void {
+    const worker = this.#worker;
+    this.#worker = undefined;
+    for (const [id, entry] of [...this.#pending]) {
+      this.#pending.delete(id);
+      clearTimeout(entry.timer);
+      entry.reject(new Error(`demo parser worker was restarted because ${reason}`));
+    }
+    if (worker !== undefined) worker.terminate().catch(() => {});
+  }
+
+  /**
    * Run one parser operation.
    *
    * The op/args pair is a discriminated union in {@link ParseRequest}, so a
@@ -102,16 +127,19 @@ export class DemoParser {
     const id = this.#sequence;
     return new Promise<ParseResult<K>>((resolve, reject) => {
       const timer = setTimeout(() => {
+        const entry = this.#pending.get(id);
+        if (entry === undefined) return;
         this.#pending.delete(id);
-        reject(new Error(`demo parsing timed out after ${Math.round(this.timeoutMs / 1000)}s`));
+        this.#retire(`request ${id} timed out`);
+        entry.reject(new Error(`demo parsing timed out after ${Math.round(this.timeoutMs / 1000)}s`));
       }, this.timeoutMs);
       if (typeof timer.unref === 'function') timer.unref();
       const onAbort = (): void => {
         const entry = this.#pending.get(id);
         if (entry === undefined) return;
         this.#pending.delete(id);
-        clearTimeout(entry.timer);
-        reject(new Error('cancelled'));
+        this.#retire(`request ${id} was cancelled`);
+        entry.reject(new Error('cancelled'));
       };
       signal?.addEventListener('abort', onAbort, { once: true });
       this.#pending.set(id, {
