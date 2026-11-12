@@ -9,28 +9,217 @@
  * round. Tick windows are stable.
  */
 
-import { num } from './util.js';
-import { UTILITY_WEAPONS } from './constants.js';
+import type {
+  BuyType, EventRow, RosterEntry, Row, RoundTickWindow, SideName, SideNumber, StableTeam,
+} from './types.ts';
+import { num, str } from './util.ts';
+import { UTILITY_WEAPONS } from './constants.ts';
 
 const TRADE_WINDOW_TICKS = 320; // 5 seconds at 64 tick
-const TICKRATE = 64;
+export const TICKRATE = 64;
 const HALF_LENGTH = 12;
 
-export const BUY_TYPES = Object.freeze([
+/** A kill as the round model stores it: identities only, no interpretation. */
+export interface KillRecord {
+  tick: number;
+  attacker: string | null;
+  attacker_name: string | null;
+  victim: string | null;
+  victim_name: string | null;
+  assister: string | null;
+  weapon: string | null;
+  headshot: boolean;
+}
+
+/** One competitive round before winners are resolved to stable teams. */
+export interface RoundRecord extends RoundTickWindow {
+  freeze_tick: number | null;
+  winner_side: SideNumber | null;
+  winner_team: StableTeam | null;
+  reason: string | null;
+  reason_code: number | null;
+  kills: KillRecord[];
+  score: { A: number; B: number };
+}
+
+/** The same round after {@link resolveRounds} mapped sides to stable teams. */
+export interface ResolvedRound extends Omit<RoundRecord, 'winner_side'> {
+  winner_side: SideName | null;
+}
+
+/** The round model plus the one demo-capability fact callers need. */
+export interface RoundModel {
+  rounds: RoundRecord[];
+  flashDataAvailable: boolean;
+}
+
+/** Side membership per round, plus the side→stable-team mapping learned from it. */
+export interface TeamModel {
+  teamsByRound: Map<number, Map<string, SideNumber>>;
+  rosterBySteam: Map<string, RosterEntry>;
+  sideToStableTeam(round: number, side: SideNumber | null | undefined): StableTeam | undefined;
+  teamOf(steamid: string, round: number | undefined): SideNumber | undefined;
+}
+
+/** One side's freeze-end economy. */
+export interface SideEconomy {
+  stable_team: StableTeam | null;
+  players: number;
+  total_balance: number;
+  average_balance: number;
+  total_equip_value: number;
+  average_equip_value: number;
+  total_start_balance: number;
+  cash_spent_this_round: number;
+  average_cash_spent_this_round: number;
+  cash_spent_match_cumulative: number;
+  buy_type: BuyType | 'pistol';
+}
+
+/** Both sides of one round's freeze-end economy. */
+export interface RoundEconomy {
+  round: number;
+  pistol_round: boolean;
+  t: SideEconomy;
+  ct: SideEconomy;
+}
+
+/** Multi-kill buckets counted per round. */
+export interface MultiKills {
+  '2k': number;
+  '3k': number;
+  '4k': number;
+  '5k': number;
+}
+
+export type MultiKillKey = keyof MultiKills;
+
+/** The accumulator behind one player's statistics. */
+interface PlayerAccumulator {
+  name: string;
+  steamid: string;
+  stable_team: StableTeam | null;
+  rounds: number;
+  kills: number;
+  deaths: number;
+  assists: number;
+  headshot_kills: number;
+  damage: number;
+  utility_damage: number;
+  enemies_flashed: number | null;
+  flash_duration: number | null;
+  kast_rounds: number;
+  traded_deaths: number;
+  opening_kills: number;
+  opening_deaths: number;
+  plants: number;
+  defuses: number;
+  multi: MultiKills;
+  clutch_wins: number;
+  clutch_situations: number;
+}
+
+/** One player's reported statistics. */
+export interface PlayerStatsRow {
+  name: string;
+  steamid: string;
+  stable_team: StableTeam | null;
+  rounds: number;
+  kills: number;
+  deaths: number;
+  assists: number;
+  kd: number;
+  headshot_kills: number;
+  hs_rate: number;
+  adr: number;
+  kast: number;
+  kpr: number;
+  dpr: number;
+  apr: number;
+  impact: number;
+  rating: number;
+  opening_kills: number;
+  opening_deaths: number;
+  opening_rate: number;
+  traded_deaths: number;
+  clutch_wins: number;
+  clutch_situations: number;
+  multi_kills: MultiKills;
+  plants: number;
+  defuses: number;
+  utility_damage: number;
+  enemies_flashed: number | null;
+  flash_duration: number | null;
+}
+
+/** One team's aggregate line. */
+export interface TeamAggregate {
+  team: StableTeam;
+  players: number;
+  rounds_won: number;
+  rounds_played: number;
+  win_rate: number;
+  kills: number;
+  deaths: number;
+  average_rating: number;
+  average_adr: number;
+}
+
+/** The player-statistics tool payload. */
+export interface PlayerStatsReport {
+  players: PlayerStatsRow[];
+  teams: { A: TeamAggregate; B: TeamAggregate };
+  limitations: string[];
+  flash_data_available: boolean;
+  team_identity_note: string;
+  rating_note: string;
+}
+
+/** One player's utility usage. */
+export interface UtilityPlayer {
+  name: string;
+  steamid: string;
+  stable_team: StableTeam | null;
+  smokes: number;
+  flashes: number;
+  molotovs: number;
+  he_grenades: number;
+  enemies_flashed: number | null;
+  flash_duration: number | null;
+  utility_damage: number;
+}
+
+/** The utility tool payload. */
+export interface UtilityReport {
+  players: UtilityPlayer[];
+  totals: {
+    smokes: number;
+    flashes: number;
+    molotovs: number;
+    he_grenades: number;
+    enemies_flashed: number | null;
+    utility_damage: number;
+  };
+  flash_data_available: boolean;
+  scope_round: number | 'all competitive rounds';
+  note: string;
+}
+
+export const BUY_TYPES: ReadonlyArray<{ max: number; name: BuyType }> = Object.freeze([
   { max: 2_000, name: 'eco' },
   { max: 3_500, name: 'semi-buy' },
   { max: 4_500, name: 'force-buy' },
   { max: Number.POSITIVE_INFINITY, name: 'full-buy' },
 ]);
 
-export function classifyBuy(averageEquipValue) {
+export function classifyBuy(averageEquipValue: number): BuyType {
   for (const bucket of BUY_TYPES) {
     if (averageEquipValue < bucket.max) return bucket.name;
   }
   return 'full-buy';
 }
 
-export function isCountedKill(event) {
+export function isCountedKill(event: Row): boolean {
   const attacker = event.attacker_steamid;
   const victim = event.user_steamid;
   if (attacker === undefined || attacker === null || victim === undefined || victim === null) return false;
@@ -39,7 +228,7 @@ export function isCountedKill(event) {
 }
 
 /** Normalize the many shapes of round_end.winner into a side number. */
-export function parseWinnerSide(value) {
+export function parseWinnerSide(value: unknown): SideNumber | undefined {
   if (typeof value === 'number') return value === 2 || value === 3 ? value : undefined;
   const text = String(value ?? '').trim().toLowerCase();
   if (text === 'ct' || text === '3' || text.includes('counter')) return 3;
@@ -47,21 +236,29 @@ export function parseWinnerSide(value) {
   return undefined;
 }
 
-export function normalizeReason(event) {
+export function normalizeReason(event: Row): string | null {
   const value = event.reason ?? event.message;
   if (typeof value === 'string' && value.trim() !== '') return value.trim();
   if (typeof value === 'number') return String(value);
   return null;
 }
 
-function lastAtOrBefore(items, tick) {
+/** The truncated, finite tick of an event, or `undefined` when it has none. */
+function tickOf(event: Row): number | undefined {
+  const tick = num(event.tick);
+  return tick === undefined || !Number.isFinite(tick) ? undefined : Math.trunc(tick);
+}
+
+function lastAtOrBefore<T extends { tick: number }>(items: readonly T[], tick: number): T | undefined {
   let low = 0;
   let high = items.length - 1;
-  let found;
+  let found: T | undefined;
   while (low <= high) {
     const middle = (low + high) >> 1;
-    if (items[middle].tick <= tick) {
-      found = items[middle];
+    const item = items[middle];
+    if (item === undefined) break;
+    if (item.tick <= tick) {
+      found = item;
       low = middle + 1;
     } else {
       high = middle - 1;
@@ -70,8 +267,8 @@ function lastAtOrBefore(items, tick) {
   return found;
 }
 
-function lastBetween(ticks, low, high) {
-  let found;
+function lastBetween(ticks: readonly number[], low: number, high: number): number | undefined {
+  let found: number | undefined;
   for (const tick of ticks) {
     if (tick > high) break;
     if (tick >= low) found = tick;
@@ -84,33 +281,38 @@ function lastBetween(ticks, low, high) {
  * the kill list for each round. Warmup rounds and malformed round_end rows are
  * dropped.
  */
-export function buildRoundModel(events) {
+export function buildRoundModel(events: readonly EventRow[]): RoundModel {
   const starts = events
-    .filter((event) => event.event_name === 'round_start' && Number.isFinite(num(event.tick)))
-    .map((event) => ({ tick: Math.trunc(num(event.tick)), warmup: event.is_warmup_period === true }))
+    .filter((event) => event.event_name === 'round_start')
+    .map((event) => ({ tick: tickOf(event), warmup: event.is_warmup_period === true }))
+    .filter((start): start is { tick: number; warmup: boolean } => start.tick !== undefined)
     .sort((left, right) => left.tick - right.tick);
   const freezes = events
-    .filter((event) => event.event_name === 'round_freeze_end' && Number.isFinite(num(event.tick)))
-    .map((event) => Math.trunc(num(event.tick)))
+    .filter((event) => event.event_name === 'round_freeze_end')
+    .map((event) => tickOf(event))
+    .filter((tick): tick is number => tick !== undefined)
     .sort((left, right) => left - right);
   const ends = events
-    .filter((event) => event.event_name === 'round_end' && Number.isFinite(num(event.tick)))
+    .filter((event) => event.event_name === 'round_end')
     .map((event) => ({
-      tick: Math.trunc(num(event.tick)),
+      tick: tickOf(event),
       side: parseWinnerSide(event.winner),
       reason: normalizeReason(event),
       reasonCode: typeof event.reason === 'number' ? event.reason : null,
     }))
     // A tick-1 round_end with no winner or reason is a recording artifact,
     // not a round. A partially valid end is kept so numbering cannot shift.
-    .filter((end) => end.tick > 1 && (end.side !== undefined || end.reason !== null))
+    .filter((end): end is { tick: number; side: SideNumber | undefined; reason: string | null; reasonCode: number | null } => (
+      end.tick !== undefined && end.tick > 1 && (end.side !== undefined || end.reason !== null)
+    ))
     .sort((left, right) => left.tick - right.tick);
 
-  const rounds = [];
+  const rounds: RoundRecord[] = [];
   for (const end of ends) {
     const start = lastAtOrBefore(starts, end.tick);
     if (start === undefined || start.warmup) continue;
-    const previousEnd = rounds.length > 0 ? rounds[rounds.length - 1].end_tick : 0;
+    const previous = rounds.at(-1);
+    const previousEnd = previous === undefined ? 0 : previous.end_tick;
     if (end.tick <= previousEnd) continue;
     const startTick = start.tick > previousEnd ? start.tick : previousEnd + 1;
     if (end.tick <= startTick) continue;
@@ -120,7 +322,7 @@ export function buildRoundModel(events) {
       start_tick: startTick,
       freeze_tick: freeze ?? null,
       end_tick: end.tick,
-      winner_side: end.side,
+      winner_side: end.side === undefined ? null : end.side,
       winner_team: null,
       reason: end.reason,
       reason_code: end.reasonCode,
@@ -129,7 +331,7 @@ export function buildRoundModel(events) {
     });
   }
 
-  const killsByRound = new Map();
+  const killsByRound = new Map<number, KillRecord[]>();
   for (const event of events) {
     if (event.event_name !== 'player_death' || event.is_warmup_period === true || !isCountedKill(event)) continue;
     const tick = num(event.tick);
@@ -143,12 +345,12 @@ export function buildRoundModel(events) {
     }
     kills.push({
       tick: Math.trunc(tick),
-      attacker: event.attacker_steamid === undefined || event.attacker_steamid === null ? null : String(event.attacker_steamid),
-      attacker_name: event.attacker_name ?? null,
-      victim: event.user_steamid === undefined || event.user_steamid === null ? null : String(event.user_steamid),
-      victim_name: event.user_name ?? null,
-      assister: event.assister_steamid === undefined || event.assister_steamid === null ? null : String(event.assister_steamid),
-      weapon: event.weapon ?? null,
+      attacker: str(event.attacker_steamid) ?? null,
+      attacker_name: str(event.attacker_name) ?? null,
+      victim: str(event.user_steamid) ?? null,
+      victim_name: str(event.user_name) ?? null,
+      assister: str(event.assister_steamid) ?? null,
+      weapon: str(event.weapon) ?? null,
       headshot: event.headshot === true,
     });
   }
@@ -160,15 +362,17 @@ export function buildRoundModel(events) {
 }
 
 /** Binary-search the display round whose [start, end] window contains a tick. */
-export function roundAtTick(tick, rounds) {
+export function roundAtTick(tick: number, rounds: readonly RoundTickWindow[]): number | undefined {
   if (!Number.isFinite(tick) || rounds.length === 0) return undefined;
   let low = 0;
   let high = rounds.length - 1;
-  let found;
+  let found: RoundTickWindow | undefined;
   while (low <= high) {
     const middle = (low + high) >> 1;
-    if (rounds[middle].end_tick >= tick) {
-      found = rounds[middle];
+    const candidate = rounds[middle];
+    if (candidate === undefined) break;
+    if (candidate.end_tick >= tick) {
+      found = candidate;
       high = middle - 1;
     } else {
       low = middle + 1;
@@ -179,9 +383,9 @@ export function roundAtTick(tick, rounds) {
 }
 
 /** Side membership per round from freeze-end ticks, plus side→stable-team votes. */
-export function buildTeamModel(tickRows, roster, rounds) {
-  const teamsByRound = new Map();
-  for (const row of Array.isArray(tickRows) ? tickRows : []) {
+export function buildTeamModel(tickRows: unknown, roster: readonly RosterEntry[], rounds: readonly RoundTickWindow[]): TeamModel {
+  const teamsByRound = new Map<number, Map<string, SideNumber>>();
+  for (const row of Array.isArray(tickRows) ? (tickRows as Row[]) : []) {
     const tick = num(row.tick);
     const round = tick === undefined ? undefined : roundAtTick(Math.trunc(tick), rounds);
     const steamid = row.steamid === undefined ? undefined : String(row.steamid);
@@ -189,18 +393,18 @@ export function buildTeamModel(tickRows, roster, rounds) {
     if (round === undefined || steamid === undefined || (side !== 2 && side !== 3)) continue;
     let teams = teamsByRound.get(round);
     if (teams === undefined) {
-      teams = new Map();
+      teams = new Map<string, SideNumber>();
       teamsByRound.set(round, teams);
     }
     teams.set(steamid, side);
   }
 
-  const rosterBySteam = new Map(roster.map((player) => [player.steamid, player]));
+  const rosterBySteam = new Map(roster.map((player): [string, RosterEntry] => [player.steamid, player]));
 
-  function sideToStableTeam(round, side) {
+  function sideToStableTeam(round: number, side: SideNumber | null | undefined): StableTeam | undefined {
     const teams = teamsByRound.get(round);
     if (teams !== undefined) {
-      const votes = new Map();
+      const votes = new Map<StableTeam, number>();
       for (const [steamid, team] of teams) {
         if (team !== side) continue;
         const stable = rosterBySteam.get(steamid)?.stable_team;
@@ -212,8 +416,8 @@ export function buildTeamModel(tickRows, roster, rounds) {
     return side === 3 ? 'A' : side === 2 ? 'B' : undefined;
   }
 
-  function teamOf(steamid, round) {
-    const side = teamsByRound.get(round)?.get(steamid);
+  function teamOf(steamid: string, round: number | undefined): SideNumber | undefined {
+    const side = round === undefined ? undefined : teamsByRound.get(round)?.get(steamid);
     if (side !== undefined) return side;
     return rosterBySteam.get(steamid)?.team_number ?? undefined;
   }
@@ -222,9 +426,9 @@ export function buildTeamModel(tickRows, roster, rounds) {
 }
 
 /** Attach stable winners and the running score to the round model. */
-export function resolveRounds(model, teamModel) {
+export function resolveRounds(model: { rounds: readonly RoundRecord[] }, teamModel: TeamModel): { rounds: ResolvedRound[] } {
   const score = { A: 0, B: 0 };
-  const rounds = model.rounds.map((round) => {
+  const rounds: ResolvedRound[] = model.rounds.map((round) => {
     const winnerTeam = teamModel.sideToStableTeam(round.round, round.winner_side);
     if (winnerTeam === 'A' || winnerTeam === 'B') score[winnerTeam] += 1;
     return {
@@ -237,7 +441,17 @@ export function resolveRounds(model, teamModel) {
   return { rounds };
 }
 
-function emptySide() {
+interface SideAccumulator {
+  steamids: Set<string>;
+  players: number;
+  totalBalance: number;
+  totalEquipValue: number;
+  totalStartBalance: number;
+  cashSpentRound: number;
+  cashSpentMatch: number;
+}
+
+function emptySide(): SideAccumulator {
   return {
     steamids: new Set(),
     players: 0,
@@ -249,7 +463,7 @@ function emptySide() {
   };
 }
 
-function finishSide(side, stableTeam, pistol) {
+function finishSide(side: SideAccumulator, stableTeam: StableTeam | undefined, pistol: boolean): SideEconomy {
   const divisor = Math.max(1, side.players);
   const averageEquip = side.totalEquipValue / divisor;
   return {
@@ -272,9 +486,13 @@ function finishSide(side, stableTeam, pistol) {
  * per-round value; `total_cash_spent` from the demo is cumulative across the
  * match and is exposed separately.
  */
-export function buildEconomy(tickRows, teamModel, model) {
-  const byRound = new Map();
-  for (const row of Array.isArray(tickRows) ? tickRows : []) {
+export function buildEconomy(
+  tickRows: unknown,
+  teamModel: TeamModel,
+  model: { rounds: readonly RoundTickWindow[] },
+): RoundEconomy[] {
+  const byRound = new Map<number, { t: SideAccumulator; ct: SideAccumulator }>();
+  for (const row of Array.isArray(tickRows) ? (tickRows as Row[]) : []) {
     const tick = num(row.tick);
     const round = tick === undefined ? undefined : roundAtTick(Math.trunc(tick), model.rounds);
     const side = num(row.team_num);
@@ -296,9 +514,10 @@ export function buildEconomy(tickRows, teamModel, model) {
     bucket.cashSpentMatch += num(row.total_cash_spent) ?? 0;
   }
 
-  const rows = [];
+  const rows: RoundEconomy[] = [];
   for (const round of [...byRound.keys()].sort((left, right) => left - right)) {
     const entry = byRound.get(round);
+    if (entry === undefined) continue;
     const pistol = round === 1 || (round - 1) % HALF_LENGTH === 0;
     rows.push({
       round,
@@ -310,9 +529,16 @@ export function buildEconomy(tickRows, teamModel, model) {
   return rows;
 }
 
-function emptyPlayer(player) {
+/** What an accumulator needs to know about a player it has never seen. */
+interface PlayerIdentity {
+  name?: unknown;
+  steamid: unknown;
+  stable_team?: StableTeam | null;
+}
+
+function emptyPlayer(player: PlayerIdentity): PlayerAccumulator {
   return {
-    name: player.name ?? String(player.steamid),
+    name: str(player.name) ?? String(player.steamid),
     steamid: String(player.steamid),
     stable_team: player.stable_team ?? null,
     rounds: 0,
@@ -336,8 +562,8 @@ function emptyPlayer(player) {
   };
 }
 
-function groupByRound(events, eventName, model) {
-  const groups = new Map();
+function groupByRound(events: readonly EventRow[], eventName: string, model: { rounds: readonly RoundTickWindow[] }): Map<number, EventRow[]> {
+  const groups = new Map<number, EventRow[]>();
   for (const event of events) {
     if (event.event_name !== eventName || event.is_warmup_period === true) continue;
     const tick = num(event.tick);
@@ -354,6 +580,19 @@ function groupByRound(events, eventName, model) {
   return groups;
 }
 
+/** Map a kill count onto the multi-kill bucket it increments. */
+function multiKillKey(count: number): MultiKillKey {
+  return `${Math.min(5, count)}k` as MultiKillKey;
+}
+
+export interface PlayerStatsInput {
+  roster: readonly RosterEntry[];
+  rounds: readonly ResolvedRound[];
+  events: readonly EventRow[];
+  teamModel: TeamModel;
+  model: { rounds: readonly RoundTickWindow[] };
+}
+
 /**
  * Player and team statistics.
  *
@@ -361,10 +600,10 @@ function groupByRound(events, eventName, model) {
  * kill or assist, survived, or was traded. Rating is the public HLTV 2.0
  * approximation; it is not an official HLTV figure.
  */
-export function computePlayerStats({ roster, rounds, events, teamModel, model }) {
+export function computePlayerStats({ roster, rounds, events, teamModel, model }: PlayerStatsInput): PlayerStatsReport {
   const rosterBySteam = teamModel.rosterBySteam;
-  const stats = new Map();
-  const limitations = [];
+  const stats = new Map<string, PlayerAccumulator>();
+  const limitations: string[] = [];
 
   const flashEvents = events.some((event) => event.event_name === 'player_blind');
   if (!flashEvents) {
@@ -373,7 +612,7 @@ export function computePlayerStats({ roster, rounds, events, teamModel, model })
 
   for (const player of roster) stats.set(player.steamid, emptyPlayer(player));
 
-  const ensure = (steamid, name) => {
+  const ensure = (steamid: unknown, name?: unknown): PlayerAccumulator | undefined => {
     if (steamid === undefined || steamid === null) return undefined;
     const key = String(steamid);
     if (key === '' || key === 'null' || key === 'undefined' || key === '0') return undefined;
@@ -382,7 +621,10 @@ export function computePlayerStats({ roster, rounds, events, teamModel, model })
       entry = emptyPlayer({ name: name ?? key, steamid: key, stable_team: rosterBySteam.get(key)?.stable_team ?? null });
       stats.set(key, entry);
     }
-    if (name !== undefined && entry.name === entry.steamid) entry.name = name;
+    if (name !== undefined && entry.name === entry.steamid) {
+      const resolved = str(name);
+      if (resolved !== undefined) entry.name = resolved;
+    }
     return entry;
   };
 
@@ -396,7 +638,7 @@ export function computePlayerStats({ roster, rounds, events, teamModel, model })
     const teams = teamModel.teamsByRound.get(roundNumber);
     if (teams === undefined) limitations.push(`round ${roundNumber}: no freeze-end team snapshot; side mapping falls back to the starting roster`);
 
-    const participants = new Set();
+    const participants = new Set<string>();
     if (teams !== undefined) {
       for (const steamid of teams.keys()) participants.add(steamid);
     } else {
@@ -407,23 +649,25 @@ export function computePlayerStats({ roster, rounds, events, teamModel, model })
       if (entry !== undefined) entry.rounds += 1;
     }
 
-    const teamOf = (steamid) => teamModel.teamOf(steamid, roundNumber);
-    const alive = new Map();
+    const teamOf = (steamid: string): SideNumber | undefined => teamModel.teamOf(steamid, roundNumber);
+    const alive = new Map<SideNumber, Set<string>>();
     for (const steamid of participants) {
       const team = teamOf(steamid);
       if (team === undefined) continue;
-      if (!alive.has(team)) alive.set(team, new Set());
-      alive.get(team).add(steamid);
+      const teammates = alive.get(team) ?? new Set<string>();
+      teammates.add(steamid);
+      alive.set(team, teammates);
     }
 
-    const killsByPlayer = new Map();
-    const assistsByPlayer = new Map();
-    const deathsByPlayer = new Set();
-    const traded = new Set();
-    const clutchCandidates = new Map();
+    const killsByPlayer = new Map<string, number>();
+    const assistsByPlayer = new Map<string, number>();
+    const deathsByPlayer = new Set<string>();
+    const traded = new Set<string>();
+    const clutchCandidates = new Map<string, number>();
 
     for (let index = 0; index < round.kills.length; index += 1) {
       const kill = round.kills[index];
+      if (kill === undefined) continue;
       const attacker = kill.attacker === null ? undefined : String(kill.attacker);
       const victim = kill.victim === null ? undefined : String(kill.victim);
       if (victim !== undefined) {
@@ -458,9 +702,10 @@ export function computePlayerStats({ roster, rounds, events, teamModel, model })
         const victimTeam = teamOf(victim);
         for (let later = index + 1; later < round.kills.length; later += 1) {
           const next = round.kills[later];
+          if (next === undefined) continue;
           const nextAttacker = next.attacker === null ? undefined : String(next.attacker);
           const nextVictim = next.victim === null ? undefined : String(next.victim);
-          const delta = (next.tick ?? 0) - (kill.tick ?? 0);
+          const delta = next.tick - kill.tick;
           if (delta < 0) continue;
           if (delta > TRADE_WINDOW_TICKS) break;
           if (nextVictim === attacker && nextAttacker !== undefined && nextAttacker !== victim) {
@@ -483,7 +728,9 @@ export function computePlayerStats({ roster, rounds, events, teamModel, model })
             const lastAlive = [...teammates][0];
             const enemies = victimTeam === 2 ? alive.get(3) : alive.get(2);
             const enemyCount = enemies?.size ?? 0;
-            if (enemyCount > 0) clutchCandidates.set(lastAlive, Math.max(clutchCandidates.get(lastAlive) ?? 0, enemyCount));
+            if (lastAlive !== undefined && enemyCount > 0) {
+              clutchCandidates.set(lastAlive, Math.max(clutchCandidates.get(lastAlive) ?? 0, enemyCount));
+            }
           }
         }
       }
@@ -492,8 +739,7 @@ export function computePlayerStats({ roster, rounds, events, teamModel, model })
     for (const [steamid, count] of killsByPlayer) {
       if (count < 2) continue;
       const entry = ensure(steamid);
-      const key = `${Math.min(5, count)}k`;
-      if (entry !== undefined && entry.multi[key] !== undefined) entry.multi[key] += 1;
+      if (entry !== undefined) entry.multi[multiKillKey(count)] += 1;
     }
 
     for (const steamid of participants) {
@@ -547,13 +793,13 @@ export function computePlayerStats({ roster, rounds, events, teamModel, model })
       const entry = ensure(attacker);
       if (entry === undefined) continue;
       entry.enemies_flashed = (entry.enemies_flashed ?? 0) + 1;
-      entry.flash_duration = (entry.flash_duration ?? 0) + (num(blind.blind_duration) ?? 0);
+      entry.flash_duration = (entry.flash_duration ?? 0) + (num(blindDuration(blind)) ?? 0);
     }
   }
 
   const players = [...stats.values()]
     .filter((entry) => entry.rounds > 0)
-    .map((entry) => {
+    .map((entry): PlayerStatsRow => {
       const roundsPlayed = Math.max(1, entry.rounds);
       const kpr = entry.kills / roundsPlayed;
       const dpr = entry.deaths / roundsPlayed;
@@ -606,7 +852,7 @@ export function computePlayerStats({ roster, rounds, events, teamModel, model })
   };
 }
 
-function teamAggregate(team, players, rounds) {
+function teamAggregate(team: StableTeam, players: readonly PlayerStatsRow[], rounds: readonly ResolvedRound[]): TeamAggregate {
   const members = players.filter((player) => player.stable_team === team);
   const won = rounds.filter((round) => round.winner_team === team).length;
   const played = rounds.length;
@@ -623,16 +869,25 @@ function teamAggregate(team, players, rounds) {
   };
 }
 
+/** The slice of the team model the utility report needs. */
+export interface UtilityInput {
+  roster: readonly RosterEntry[];
+  events: readonly EventRow[];
+  model: { rounds: readonly RoundTickWindow[]; flashDataAvailable: boolean };
+  teamModel: Pick<TeamModel, 'rosterBySteam' | 'teamOf'>;
+  round?: number;
+}
+
 /**
  * Utility usage per player. Detonations are deduplicated by entity id because
  * a single smoke can emit several detonate events. Flash effectiveness is
  * reported only when the demo contains player_blind events.
  */
-export function computeUtility({ roster, events, model, teamModel, round }) {
-  const players = new Map();
-  const seen = new Set();
+export function computeUtility({ roster, events, model, teamModel, round }: UtilityInput): UtilityReport {
+  const players = new Map<string, UtilityPlayer>();
+  const seen = new Set<string>();
 
-  const ensure = (steamid, name) => {
+  const ensure = (steamid: unknown, name?: unknown): UtilityPlayer | undefined => {
     if (steamid === undefined || steamid === null) return undefined;
     const key = String(steamid);
     if (key === '' || key === 'null' || key === 'undefined' || key === '0') return undefined;
@@ -640,7 +895,7 @@ export function computeUtility({ roster, events, model, teamModel, round }) {
     if (entry === undefined) {
       const known = teamModel.rosterBySteam.get(key);
       entry = {
-        name: known?.name ?? name ?? key,
+        name: str(known?.name) ?? str(name) ?? key,
         steamid: key,
         stable_team: known?.stable_team ?? null,
         smokes: 0,
@@ -658,7 +913,7 @@ export function computeUtility({ roster, events, model, teamModel, round }) {
 
   for (const player of roster) ensure(player.steamid, player.name);
 
-  const inScope = (event) => {
+  const inScope = (event: EventRow): boolean => {
     if (event.is_warmup_period === true) return false;
     const tick = num(event.tick);
     if (tick === undefined) return false;
@@ -684,20 +939,22 @@ export function computeUtility({ roster, events, model, teamModel, round }) {
       const attacker = stringOrUndefined(event.attacker_steamid);
       const victim = stringOrUndefined(event.user_steamid);
       if (attacker === undefined || victim === undefined || attacker === victim) continue;
-      const mapped = roundAtTick(Math.trunc(num(event.tick)), model.rounds);
+      const eventTick = num(event.tick);
+      if (eventTick === undefined) continue;
+      const mapped = roundAtTick(Math.trunc(eventTick), model.rounds);
       const attackerTeam = teamModel.teamOf(attacker, mapped);
       const victimTeam = teamModel.teamOf(victim, mapped);
       if (attackerTeam === undefined || victimTeam === undefined || attackerTeam === victimTeam) continue;
       const entry = ensure(attacker);
       if (entry === undefined) continue;
-      entry.enemies_flashed += 1;
-      entry.flash_duration += num(blind_duration(event)) ?? 0;
+      entry.enemies_flashed = (entry.enemies_flashed ?? 0) + 1;
+      entry.flash_duration = (entry.flash_duration ?? 0) + (num(blindDuration(event)) ?? 0);
       continue;
     }
 
     const entityKey = event.entityid ?? event.entity_id;
     if (entityKey !== undefined) {
-      const key = `${event.event_name}:${entityKey}`;
+      const key = `${event.event_name}:${String(entityKey)}`;
       if (seen.has(key)) continue;
       seen.add(key);
     }
@@ -714,7 +971,7 @@ export function computeUtility({ roster, events, model, teamModel, round }) {
     }
   }
 
-  const rows = [...players.values()]
+  const rows: UtilityPlayer[] = [...players.values()]
     .map((entry) => ({
       ...entry,
       flash_duration: entry.flash_duration === null ? null : round2(entry.flash_duration),
@@ -740,22 +997,20 @@ export function computeUtility({ roster, events, model, teamModel, round }) {
   };
 }
 
-function blind_duration(event) {
+function blindDuration(event: Row): unknown {
   return event.blind_duration ?? event.flash_duration ?? 0;
 }
 
-function stringOrUndefined(value) {
+function stringOrUndefined(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
   const text = String(value);
   return text === '' || text === 'null' || text === 'undefined' ? undefined : text;
 }
 
-export function round2(value) {
+export function round2(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
-export function round3(value) {
+export function round3(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
-
-export { TICKRATE };

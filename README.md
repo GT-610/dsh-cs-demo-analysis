@@ -16,13 +16,13 @@ DeepSeek Harness 的《反恐精英 2》demo 复盘模式。它在标准模式�
 ## 环境要求
 
 - DeepSeek Harness Desktop，或支持安装 bundle 的 `dsh` profile。
-- Node.js 20 或更高版本。
+- Node.js 22.19 或更高版本（源码用 TypeScript 编写，测试直接跑 `.ts`）。
 - 一份 Counter-Strike 2（Source 2）demo。CS:GO demo 不受支持。
 - macOS arm64/x64、Windows x64 或 Linux x64/arm64（`@laihoe/demoparser2` 提供预编译包）。
 
 ## 安装
 
-1. 在本目录安装依赖：
+1. 在本目录安装依赖。`prepare` 钩子会顺带把 `src/*.ts` 构建到 `dist/`：
 
    ```bash
    npm install
@@ -97,14 +97,17 @@ CS2 demo 自带 `m_szLastPlaceName`，即游戏对玩家所在区域的口径。
 
 ## 架构
 
-- `src/parse-worker.js`：worker 线程中的 N-API 解析；手雷在 worker 内先聚合再回传。
-- `src/parser.js`：可重启的主线程客户端，带超时与取消。
-- `src/demo-store.js`：会话工作区路径解析、`PBDEMS2` 校验、按文件版本缓存 header/阵容/事件。
-- `src/analysis.js`：回合窗口、经济、选手统计、道具统计。
-- `src/spatial.js`：回合时间窗、tick 采样、地名/网格聚合。
-- `src/tools.js`：模型可见的工具与边界。
-- `src/plugin.js`：preset 挂载入口与 runtime skill 注册。
+- `src/parse-worker.ts`：worker 线程中的 N-API 解析；手雷在 worker 内先聚合再回传。
+- `src/parser.ts`：可重启的主线程客户端，带超时与取消。
+- `src/demo-store.ts`：会话工作区路径解析、`PBDEMS2` 校验、按文件版本缓存 header/阵容/事件。
+- `src/analysis.ts`：回合窗口、经济、选手统计、道具统计。
+- `src/spatial.ts`：回合时间窗、tick 采样、地名/网格聚合。
+- `src/tools.ts`：模型可见的工具与边界。
+- `src/plugin.ts`：preset 挂载入口与 runtime skill 注册。
+- `src/types.ts`、`src/worker-protocol.ts`：领域类型与 worker RPC 契约。
 - `skills/cs2-review/SKILL.md`：复盘流程、指标口径与报告模板。
+
+`src/` 是 TypeScript 源码，`dist/` 是构建产物（两个入口：`plugin.js` 与 `parse-worker.js`），`exports` 指向 `dist/`。
 
 所有返回行的工具都会均匀采样、限制序列化体积，并报告 `truncated` / `sampled`。
 
@@ -112,8 +115,13 @@ CS2 demo 自带 `m_szLastPlaceName`，即游戏对玩家所在区域的口径。
 
 ```bash
 npm install
-npm test
+npm run typecheck   # tsc --noEmit
+npm run build       # tsdown，产出 dist/
+npm run dev         # tsdown --watch，改源码自动重建
+npm test            # node --test，直接跑 src/ 的 .ts
 ```
+
+`npm test` 依赖 Node 22.18+ 的类型擦除能力直接执行 TypeScript，不经过构建；`npm run build` 只在打包或本地安装后由 Harness 加载时需要。
 
 不带环境变量时只跑单元测试。用真实 demo 跑集成测试：
 

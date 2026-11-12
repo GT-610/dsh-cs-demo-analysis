@@ -7,16 +7,17 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { DemoParser } from './parser.js';
-import { DemoStore } from './demo-store.js';
-import { createTools } from './tools.js';
+import { DemoParser } from './parser.ts';
+import { DemoStore } from './demo-store.ts';
+import { createTools } from './tools.ts';
+import type { LoadedSkill, PluginContext } from './types.ts';
 
 export const name = 'cs2-demo-analysis';
 export const inject = ['tools', 'workingDirectory'];
 
-export function loadSkill() {
+export function loadSkill(): LoadedSkill {
   const url = new URL('../skills/cs2-review/SKILL.md', import.meta.url);
-  let text;
+  let text: string;
   try {
     text = readFileSync(url, 'utf8');
   } catch (error) {
@@ -35,7 +36,7 @@ export function loadSkill() {
   };
 }
 
-export function apply(ctx) {
+export function apply(ctx: PluginContext): void {
   const parser = new DemoParser();
   const store = new DemoStore(ctx, parser);
 
@@ -43,16 +44,16 @@ export function apply(ctx) {
     ctx.tools.register(definition);
   }
 
-  const skills = ctx.get?.('skills');
+  const skills = ctx.get<{ register(skill: LoadedSkill): void }>('skills');
   if (skills !== undefined && typeof skills.register === 'function') {
     const skill = loadSkill();
     if (skill.error !== undefined) {
-      ctx.logger?.warn?.(`cs2-review skill was not registered: ${skill.error}`);
+      ctx.logger?.warn(`cs2-review skill was not registered: ${skill.error}`);
     } else {
       try {
         skills.register(skill);
       } catch (error) {
-        ctx.logger?.warn?.(`cs2-review skill was not registered: ${error instanceof Error ? error.message : String(error)}`);
+        ctx.logger?.warn(`cs2-review skill was not registered: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   }

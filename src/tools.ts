@@ -11,11 +11,15 @@ import { isAbsolute, join, resolve } from 'node:path';
 import {
   MAX_EVENT_NAMES, MAX_EVENT_ROWS, MAX_PROPERTIES, MAX_REQUESTED_TICKS,
   MAX_SERIALIZED_ROWS_BYTES, MAX_STEAM_IDS, MAX_TICK_ROWS,
-} from './constants.js';
-import { buildEconomy, buildRoundModel, buildTeamModel, computePlayerStats, computeUtility, resolveRounds, roundAtTick } from './analysis.js';
-import { textRender } from './render.js';
-import { aggregatePositions, buildRoundWindows, sampleWindowTicks } from './spatial.js';
-import { bestWeapon, clampInt, equidistantIndices, num, sampleRows, str } from './util.js';
+} from './constants.ts';
+import { buildEconomy, buildRoundModel, buildTeamModel, computePlayerStats, computeUtility, resolveRounds, roundAtTick } from './analysis.ts';
+import { textRender } from './render.ts';
+import type { PlayerSpatial, PositionReport, RoundWindow, TeamSpatial } from './spatial.ts';
+import { aggregatePositions, buildRoundWindows, sampleWindowTicks } from './spatial.ts';
+import type { PositionRow, RosterEntry, Row, ToolDefinition, ToolExec } from './types.ts';
+import type { Grenade } from './worker-protocol.ts';
+import { bestWeapon, clampInt, equidistantIndices, num, sampleRows } from './util.ts';
+import type { DemoStore, ResolvedDemo } from './demo-store.ts';
 
 const DEMO_PARAM = {
   type: 'string',
@@ -27,7 +31,15 @@ const LIMIT_PARAM = {
   description: 'Maximum rows to return. Larger results are evenly sampled and marked sampled=true.',
 };
 
-function tool(definition) {
+/** A tool before the shared output contract is attached. */
+interface ToolSpec {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  execute(args: Record<string, unknown>, exec: ToolExec): Promise<unknown>;
+}
+
+function tool(definition: ToolSpec): ToolDefinition {
   return {
     name: definition.name,
     description: definition.description,
@@ -40,16 +52,16 @@ function tool(definition) {
   };
 }
 
-function objectSchema(properties, required = []) {
+function objectSchema(properties: Record<string, unknown>, required: string[] = []): Record<string, unknown> {
   return { type: 'object', properties, required, additionalProperties: false };
 }
 
-function requireString(value, name) {
+function requireString(value: unknown, name: string): string {
   if (typeof value !== 'string' || value.trim() === '') throw new Error(`${name} must be a non-empty string.`);
   return value.trim();
 }
 
-function optionalStringArray(value, name, { max, pattern } = {}) {
+function optionalStringArray(value: unknown, name: string, { max, pattern }: { max?: number; pattern?: RegExp } = {}): string[] {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) throw new Error(`${name} must be an array of strings.`);
   if (value.length > (max ?? 64)) throw new Error(`${name} accepts at most ${max ?? 64} entries.`);
@@ -62,7 +74,7 @@ function optionalStringArray(value, name, { max, pattern } = {}) {
   return [...new Set(entries)];
 }
 
-function optionalIntArray(value, name, { max, min = 0 } = {}) {
+function optionalIntArray(value: unknown, name: string, { max, min = 0 }: { max?: number; min?: number } = {}): number[] | undefined {
   if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value)) throw new Error(`${name} must be an array of integers.`);
   if (value.length === 0) return undefined;
@@ -76,10 +88,20 @@ function optionalIntArray(value, name, { max, min = 0 } = {}) {
   }))];
 }
 
-function boundRows(rows, limit) {
+interface BoundedRows<T> {
+  rows: T[];
+  meta: {
+    row_count: number;
+    original_row_count: number;
+    truncated: boolean;
+    sampled: boolean;
+  };
+}
+
+function boundRows<T>(rows: readonly T[], limit: number): BoundedRows<T> {
   const total = rows.length;
   let sampled = false;
-  let picked = rows;
+  let picked = [...rows];
   if (limit < total) {
     picked = sampleRows(rows, limit).rows;
     sampled = true;
@@ -101,7 +123,7 @@ function boundRows(rows, limit) {
   };
 }
 
-function matchesWhere(row, where) {
+function matchesWhere(row: Row, where: unknown): boolean {
   if (where === undefined || where === null) return true;
   if (typeof where !== 'object' || Array.isArray(where)) throw new Error('where must be an object of field/value pairs.');
   for (const [field, expected] of Object.entries(where)) {
@@ -121,11 +143,19 @@ function matchesWhere(row, where) {
   return true;
 }
 
-async function collectDemos(directory, limit) {
-  const found = [];
-  const queue = [{ path: directory, depth: 0 }];
+/** One demo file found by the directory scan. */
+interface DemoFile {
+  path: string;
+  size_bytes: number;
+  modified: string;
+}
+
+async function collectDemos(directory: string, limit: number): Promise<DemoFile[]> {
+  const found: DemoFile[] = [];
+  const queue: Array<{ path: string; depth: number }> = [{ path: directory, depth: 0 }];
   while (queue.length > 0 && found.length < limit) {
     const current = queue.shift();
+    if (current === undefined) break;
     let entries;
     try {
       entries = await readdir(current.path, { withFileTypes: true });
@@ -151,11 +181,10 @@ async function collectDemos(directory, limit) {
   return found;
 }
 
-
-function resolvePlayerFilter(roster, values) {
+function resolvePlayerFilter(roster: readonly RosterEntry[], values: unknown): string[] | null {
   if (values === undefined || values === null) return null;
   if (!Array.isArray(values) || values.length === 0) return null;
-  const wanted = [];
+  const wanted: string[] = [];
   for (const value of values) {
     const text = requireString(value, 'players entry');
     const byId = roster.find((player) => player.steamid === text);
@@ -169,7 +198,29 @@ function resolvePlayerFilter(roster, values) {
   return [...new Set(wanted)];
 }
 
-async function samplePositions(exec, store, resolved, roster, { round, fromRound, toRound, stepSeconds, maxTicks, players }) {
+/** The round scope and sampling budget of one position query. */
+interface PositionQuery {
+  round?: number;
+  fromRound?: number;
+  toRound?: number;
+  stepSeconds: number;
+  maxTicks: number;
+  players: string[] | null;
+}
+
+interface SampledPositions {
+  rows: PositionRow[];
+  windows: RoundWindow[];
+  step: number;
+  elapsedMs: number;
+}
+
+async function samplePositions(
+  exec: ToolExec,
+  store: DemoStore,
+  resolved: ResolvedDemo,
+  { round, fromRound, toRound, stepSeconds, maxTicks, players }: PositionQuery,
+): Promise<SampledPositions> {
   const events = await store.eventRows(
     exec,
     resolved,
@@ -194,7 +245,7 @@ async function samplePositions(exec, store, resolved, roster, { round, fromRound
     players,
   }, exec.signal);
 
-  const rows = [];
+  const rows: PositionRow[] = [];
   for (const row of result.data) {
     const x = num(row.X);
     const y = num(row.Y);
@@ -206,11 +257,11 @@ async function samplePositions(exec, store, resolved, roster, { round, fromRound
       round: displayRound,
       tick: Math.trunc(tick),
       steamid: String(row.steamid),
-      name: row.name ?? null,
+      name: typeof row.name === 'string' ? row.name : null,
       team_num: num(row.team_num) ?? null,
       x: Math.round(x * 10) / 10,
       y: Math.round(y * 10) / 10,
-      place: row.last_place_name ?? null,
+      place: typeof row.last_place_name === 'string' ? row.last_place_name : null,
       bomb_zone: row.in_bomb_zone === true,
       buy_zone: row.in_buy_zone === true,
     });
@@ -218,18 +269,21 @@ async function samplePositions(exec, store, resolved, roster, { round, fromRound
   return { rows, windows, step, elapsedMs: result.elapsedMs };
 }
 
-
 /**
  * Replace raw bomb_planted site/c4 fields with a readable site label derived
  * from the planter's in-game place name at the plant tick.
  */
-async function annotateBombSites(exec, store, resolved, rows) {
+async function annotateBombSites(exec: ToolExec, store: DemoStore, resolved: ResolvedDemo, rows: Row[]): Promise<Row[]> {
   const plants = rows.filter((row) => row.event_name === 'bomb_planted');
   if (plants.length === 0) return rows;
-  const ticks = [...new Set(plants.map((row) => Math.trunc(num(row.tick))).filter((tick) => Number.isFinite(tick)))];
+  const ticks = [...new Set(plants
+    .map((row) => Math.trunc(num(row.tick) ?? Number.NaN))
+    .filter((tick) => Number.isFinite(tick)))];
   if (ticks.length === 0) return rows;
-  const players = [...new Set(plants.map((row) => (row.user_steamid === undefined ? undefined : String(row.user_steamid))).filter(Boolean))];
-  let placeByKey = new Map();
+  const players = [...new Set(plants
+    .map((row) => (row.user_steamid === undefined ? undefined : String(row.user_steamid)))
+    .filter((player): player is string => Boolean(player)))];
+  let placeByKey = new Map<string, string | null>();
   try {
     const result = await store.parser.call('ticks', {
       path: resolved.path,
@@ -238,14 +292,14 @@ async function annotateBombSites(exec, store, resolved, rows) {
       players: players.length > 0 ? players : null,
     }, exec.signal);
     for (const row of result.data) {
-      placeByKey.set(`${row.tick}:${row.steamid}`, row.last_place_name ?? null);
+      placeByKey.set(`${String(row.tick)}:${String(row.steamid)}`, typeof row.last_place_name === 'string' ? row.last_place_name : null);
     }
   } catch {
     placeByKey = new Map();
   }
   return rows.map((row) => {
     if (row.event_name !== 'bomb_planted') return row;
-    const place = placeByKey.get(`${row.tick}:${row.user_steamid}`) ?? null;
+    const place = placeByKey.get(`${String(row.tick)}:${String(row.user_steamid)}`) ?? null;
     const label = place !== null && /^bombsitea/i.test(place) ? 'A'
       : place !== null && /^bombsiteb/i.test(place) ? 'B'
         : null;
@@ -260,7 +314,12 @@ async function annotateBombSites(exec, store, resolved, rows) {
   });
 }
 
-export function createTools(store) {
+/** Fall back to an empty team block for the degenerate no-sample report. */
+function teamOrEmpty(team: TeamSpatial | null): TeamSpatial {
+  return team ?? { samples: 0, places: [], top_cells: [] };
+}
+
+export function createTools(store: DemoStore): ToolDefinition[] {
   return [
     tool({
       name: 'cs2_find_demos',
@@ -368,7 +427,7 @@ export function createTools(store) {
         });
         if (names.length === 0) throw new Error('event_names must contain at least one event name.');
         const playerProps = optionalStringArray(args.player_props, 'player_props', { max: MAX_PROPERTIES });
-        let otherProps = optionalStringArray(args.other_props, 'other_props', { max: MAX_PROPERTIES });
+        const otherProps = optionalStringArray(args.other_props, 'other_props', { max: MAX_PROPERTIES });
         const limit = clampInt(args.limit, 1, MAX_EVENT_ROWS, 1000);
 
         const includeWarmup = args.include_warmup === true;
@@ -386,7 +445,7 @@ export function createTools(store) {
 
         const rows = await store.eventRows(exec, resolved, names, playerProps, otherProps);
         const filtered = rows
-          .map((row) => {
+          .map((row): Row => {
             const tick = num(row.tick);
             return {
               ...row,
@@ -394,7 +453,7 @@ export function createTools(store) {
             };
           })
           .filter((row) => includeWarmup || row.round !== null)
-          .filter((row) => wantedRounds === undefined || (row.round !== null && wantedRounds.includes(row.round)))
+          .filter((row) => wantedRounds === undefined || (row.round != null && wantedRounds.includes(row.round)))
           .filter((row) => matchesWhere(row, where));
         const annotated = await annotateBombSites(exec, store, resolved, filtered);
         const bounded = boundRows(annotated, limit);
@@ -455,8 +514,8 @@ export function createTools(store) {
           ticks,
           players: players.length > 0 ? players : null,
         }, exec.signal);
-        const rows = wantsActiveWeapon
-          ? result.data.map((row) => {
+        const rows: Row[] = wantsActiveWeapon
+          ? result.data.map((row): Row => {
             if (!Array.isArray(row.inventory)) return row;
             const { inventory, ...rest } = row;
             const weapon = bestWeapon(inventory);
@@ -519,7 +578,7 @@ export function createTools(store) {
         const format = args.format === 'rows' ? 'rows' : 'heatmap';
         const limit = clampInt(args.limit, 1, MAX_TICK_ROWS, 2000);
 
-        const sampled = await samplePositions(exec, store, resolved, roster, {
+        const sampled = await samplePositions(exec, store, resolved, {
           round,
           fromRound,
           toRound,
@@ -538,12 +597,12 @@ export function createTools(store) {
           cellUnits: clampInt(args.cell_units, 32, 2048, 256),
           topCells: clampInt(args.top_cells, 1, 30, 12),
         });
-        const tinyPlaces = (places, limit) => places.slice(0, limit).map((place) => ({
+        const tinyPlaces = (places: PlayerSpatial['places'], cap: number): Array<{ place: string; samples: number; share: number }> => places.slice(0, cap).map((place) => ({
           place: place.place,
           samples: place.samples,
           share: place.share,
         }));
-        const compactPlayer = (player) => ({
+        const compactPlayer = (player: PlayerSpatial) => ({
           name: player.name,
           steamid: player.steamid,
           stable_team: player.stable_team,
@@ -553,27 +612,28 @@ export function createTools(store) {
           places: tinyPlaces(player.places, 5),
           ...(includeCells ? { top_cells: player.top_cells } : {}),
         });
-        const compactTeam = (team) => ({
+        const compactTeam = (team: TeamSpatial) => ({
           samples: team.samples,
           places: tinyPlaces(team.places, 6),
           ...(includeCells ? { top_cells: team.top_cells } : {}),
         });
+        const report: PositionReport = aggregated;
         return {
           data: {
-            map: base.header?.map_name ?? null,
+            map: base.header.map_name ?? null,
             rounds: sampled.windows.map((window) => window.round),
             sample_step_seconds: Math.round((sampled.step / 64) * 10) / 10,
-            players: aggregated.players.map(compactPlayer),
-            teams: { A: compactTeam(aggregated.teams.A), B: compactTeam(aggregated.teams.B) },
-            places: aggregated.places.slice(0, 15).map((place) => ({
+            players: report.players.map(compactPlayer),
+            teams: { A: compactTeam(teamOrEmpty(report.teams.A)), B: compactTeam(teamOrEmpty(report.teams.B)) },
+            places: report.places.slice(0, 15).map((place) => ({
               place: place.place,
               samples: place.samples,
               share: place.share,
               bomb_zone_samples: place.bomb_zone_samples,
             })),
-            bounds: aggregated.bounds,
-            cell_units: aggregated.cell_units,
-            note: aggregated.note,
+            bounds: report.bounds,
+            cell_units: report.cell_units,
+            note: report.note,
           },
           meta: { row_count: sampled.rows.length, elapsed_ms: sampled.elapsedMs },
         };
@@ -607,28 +667,28 @@ export function createTools(store) {
         const roster = await store.roster(exec, resolved);
         const base = await store.base(exec, resolved);
         const stepSeconds = Math.min(30, Math.max(1, num(args.step_seconds) ?? 4));
-        const sampled = await samplePositions(exec, store, resolved, roster, {
+        const sampled = await samplePositions(exec, store, resolved, {
           stepSeconds,
           maxTicks: 3000,
           players: null,
         });
         const aggregated = aggregatePositions(sampled.rows, roster, { cellUnits: 256, topCells: 8 });
         const limitPlaces = clampInt(args.limit_places, 1, 60, 20);
-        const compactPlaces = (places, limit) => places.slice(0, limit).map((place) => ({
+        const compactPlaces = (places: PlayerSpatial['places'], cap: number) => places.slice(0, cap).map((place) => ({
           place: place.place,
           samples: place.samples,
           share: place.share,
           teams: place.teams,
           bounds: place.bounds,
         }));
-        const compactTeam = (team) => ({
+        const compactTeam = (team: TeamSpatial) => ({
           samples: team.samples,
           places: compactPlaces(team.places, 10),
           ...(args.include_cells === true ? { top_cells: team.top_cells } : {}),
         });
         return {
           data: {
-            map: base.header?.map_name ?? null,
+            map: base.header.map_name ?? null,
             rounds: aggregated.rounds,
             sample_step_seconds: Math.round((sampled.step / 64) * 10) / 10,
             place_catalog: compactPlaces(aggregated.places, limitPlaces),
@@ -640,7 +700,7 @@ export function createTools(store) {
                 samples: place.bomb_zone_samples,
                 bounds: place.bomb_target_bounds,
               })),
-            teams: { A: compactTeam(aggregated.teams.A), B: compactTeam(aggregated.teams.B) },
+            teams: { A: compactTeam(teamOrEmpty(aggregated.teams.A)), B: compactTeam(teamOrEmpty(aggregated.teams.B)) },
             ...(args.include_players === true ? {
               player_samples: aggregated.players.map((player) => ({
                 name: player.name,
@@ -692,7 +752,7 @@ export function createTools(store) {
         );
         const model = buildRoundModel(bounds);
 
-        const withRounds = [];
+        const withRounds: Array<Grenade & { round: number }> = [];
         for (const grenade of result.data) {
           const round = roundAtTick(grenade.start_tick, model.rounds);
           if (round === undefined) continue;
