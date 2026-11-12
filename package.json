@@ -1,0 +1,54 @@
+{
+  "name": "dsh-cs2-demo-analysis",
+  "version": "0.1.0",
+  "description": "Counter-Strike 2 demo analysis mode for DeepSeek Harness: local parsing, round/economy/player statistics, map awareness, and post-match review tools.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/plugin.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "src",
+    "skills",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en-US.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@laihoe/demoparser2": "0.42.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "counter-strike",
+    "cs2",
+    "demo",
+    "replay",
+    "analysis"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GT-610/dsh-cs-demo-analysis.git"
+  },
+  "homepage": "https://github.com/GT-610/dsh-cs-demo-analysis#readme",
+  "bugs": {
+    "url": "https://github.com/GT-610/dsh-cs-demo-analysis/issues"
+  }
+}

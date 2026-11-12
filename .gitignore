@@ -1,0 +1,17 @@
+node_modules/
+.vscode/
+.DS_Store
+dist/
+coverage/
+*.log
+
+# Demo files are large fixtures; never commit them.
+*.dem
+*.dem.bz2
+*.dem.gz
+*.dem.zst
+*.rar
+*.zip
+
+# Local analysis cache
+.dsh-cache/
