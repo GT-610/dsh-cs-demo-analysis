@@ -10,13 +10,17 @@
 import { open, stat } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { MAX_DEMO_BYTES } from './constants.js';
-import { formatBytes, num, str } from './util.js';
+import { MAX_DEMO_BYTES } from './constants.ts';
+import { formatBytes, num, str } from './util.ts';
+import type { DemoParser } from './parser.ts';
+import type {
+  DemoStoreContext, EventRow, RosterEntry, Row, SideNumber, StableTeam, ToolExec,
+} from './types.ts';
 
 const MAX_CACHED_DEMOS = 4;
 const MAX_CACHED_EVENT_SETS = 8;
 
-const COMPRESSED_FORMATS = [
+const COMPRESSED_FORMATS: ReadonlyArray<{ magic: string; hint: string }> = [
   { magic: 'BZh', hint: 'This is a bzip2 archive. Decompress it to a .dem file first.' },
   { magic: 'PK', hint: 'This is a zip archive. Extract the .dem file inside it first.' },
   { magic: 'Rar!', hint: 'This is a RAR archive. Extract the .dem file inside it first.' },
@@ -49,17 +53,42 @@ const FREEZE_TICK_PROPS = [
   'total_cash_spent',
 ];
 
-function isWindowsAbsolute(value) {
+/** A validated demo on disk, keyed by its file revision. */
+export interface ResolvedDemo {
+  path: string;
+  size: number;
+  mtimeMs: number;
+}
+
+/** The stable, expensive facts about a demo. */
+export interface DemoBase extends ResolvedDemo {
+  header: Record<string, unknown>;
+  players: Row[];
+  eventNames: string[];
+  elapsedMs: number;
+}
+
+/** The shared evidence bundle for round, economy, and player-stat analysis. */
+export interface AnalysisBundle {
+  base: DemoBase;
+  roster: RosterEntry[];
+  events: EventRow[];
+  freezeEnds: EventRow[];
+  tickRows: Row[];
+  elapsedMs: number;
+}
+
+function isWindowsAbsolute(value: string): boolean {
   return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value);
 }
 
-function expandHome(value) {
+function expandHome(value: string): string {
   if (value === '~') return homedir();
   if (value.startsWith('~/') || value.startsWith('~\\')) return join(homedir(), value.slice(2));
   return value;
 }
 
-async function inspectDemoFile(absPath) {
+async function inspectDemoFile(absPath: string): Promise<{ size: number; mtimeMs: number }> {
   let info;
   try {
     info = await stat(absPath);
@@ -76,7 +105,7 @@ async function inspectDemoFile(absPath) {
   }
 
   const handle = await open(absPath, 'r');
-  let head;
+  let head: Buffer;
   try {
     const buffer = Buffer.alloc(16);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
@@ -96,26 +125,29 @@ async function inspectDemoFile(absPath) {
       + 'non-demo files are not supported.',
     );
   }
-  return info;
+  return { size: info.size, mtimeMs: info.mtimeMs };
 }
 
 export class DemoStore {
-  constructor(ctx, parser) {
+  readonly ctx: DemoStoreContext;
+  readonly parser: DemoParser;
+  readonly demos = new Map<string, DemoBase>();
+  readonly eventSets = new Map<string, Row[]>();
+
+  constructor(ctx: DemoStoreContext, parser: DemoParser) {
     this.ctx = ctx;
     this.parser = parser;
-    this.demos = new Map();
-    this.eventSets = new Map();
   }
 
-  async cwd(exec) {
-    if (exec?.agent !== undefined && this.ctx?.workingDirectory !== undefined) {
+  async cwd(exec?: ToolExec): Promise<string> {
+    if (exec?.agent !== undefined && this.ctx.workingDirectory !== undefined) {
       return this.ctx.workingDirectory.ensure(exec.agent, exec.signal);
     }
     return process.cwd();
   }
 
   /** Resolve the model-supplied path against the session workspace and validate it. */
-  async resolve(exec, demo) {
+  async resolve(exec: ToolExec, demo: unknown): Promise<ResolvedDemo> {
     const raw = typeof demo === 'string' ? demo.trim() : '';
     if (raw === '') throw new Error('A demo path is required.');
     if (/^file:\/\//i.test(raw)) throw new Error('Pass a filesystem path, not a file:// URL.');
@@ -129,15 +161,16 @@ export class DemoStore {
     return { path: absPath, size: info.size, mtimeMs: info.mtimeMs };
   }
 
-  #evictDemos() {
+  #evictDemos(): void {
     while (this.demos.size > MAX_CACHED_DEMOS) {
       const oldest = this.demos.keys().next().value;
+      if (oldest === undefined) break;
       this.demos.delete(oldest);
     }
   }
 
   /** Header, roster, and event-name catalog, parsed once per file revision. */
-  async base(exec, resolved) {
+  async base(exec: ToolExec, resolved: ResolvedDemo): Promise<DemoBase> {
     const cached = this.demos.get(resolved.path);
     if (cached !== undefined && cached.mtimeMs === resolved.mtimeMs && cached.size === resolved.size) {
       return cached;
@@ -147,7 +180,7 @@ export class DemoStore {
       this.parser.call('players', { path: resolved.path }, exec.signal),
       this.parser.call('eventNames', { path: resolved.path }, exec.signal),
     ]);
-    const record = {
+    const record: DemoBase = {
       path: resolved.path,
       size: resolved.size,
       mtimeMs: resolved.mtimeMs,
@@ -162,15 +195,16 @@ export class DemoStore {
     return record;
   }
 
-  #evictEventSets() {
+  #evictEventSets(): void {
     while (this.eventSets.size > MAX_CACHED_EVENT_SETS) {
       const oldest = this.eventSets.keys().next().value;
+      if (oldest === undefined) break;
       this.eventSets.delete(oldest);
     }
   }
 
   /** Parse an event set once; later tools reuse the same bounded rows. */
-  async eventRows(exec, resolved, names, playerProps = [], otherProps = []) {
+  async eventRows(exec: ToolExec, resolved: ResolvedDemo, names: string[], playerProps: string[] = [], otherProps: string[] = []): Promise<Row[]> {
     const key = JSON.stringify([resolved.path, resolved.size, resolved.mtimeMs, names, playerProps, otherProps]);
     const cached = this.eventSets.get(key);
     if (cached !== undefined) {
@@ -190,7 +224,7 @@ export class DemoStore {
   }
 
   /** Stable roster: Team A is the roster that starts CT, Team B starts T. */
-  async roster(exec, resolved) {
+  async roster(exec: ToolExec, resolved: ResolvedDemo): Promise<RosterEntry[]> {
     const base = await this.base(exec, resolved);
     const spawns = await this.eventRows(
       exec,
@@ -203,7 +237,7 @@ export class DemoStore {
   }
 
   /** Shared evidence bundle for round, economy, and player-stat analysis. */
-  async analysis(exec, resolved) {
+  async analysis(exec: ToolExec, resolved: ResolvedDemo): Promise<AnalysisBundle> {
     const base = await this.base(exec, resolved);
     const roster = await this.roster(exec, resolved);
     const events = await this.eventRows(
@@ -218,8 +252,8 @@ export class DemoStore {
       && event.is_warmup_period !== true
       && Number.isFinite(num(event.tick))
       && Number.isFinite(num(event.total_rounds_played)));
-    const freezeTicks = [...new Set(freezeEnds.map((event) => Math.trunc(num(event.tick))))];
-    let tickRows = [];
+    const freezeTicks = [...new Set(freezeEnds.map((event) => Math.trunc(num(event.tick) ?? 0)))];
+    let tickRows: Row[] = [];
     let tickElapsedMs = 0;
     if (freezeTicks.length > 0) {
       const ticks = await this.parser.call('ticks', {
@@ -242,10 +276,18 @@ export class DemoStore {
     };
   }
 
-  dispose() {
+  dispose(): void {
     this.demos.clear();
     this.eventSets.clear();
   }
+}
+
+interface Identity {
+  name: string;
+  steamid: string;
+  tick: number;
+  teamNumber: SideNumber | undefined;
+  source: RosterEntry['team_source'];
 }
 
 /**
@@ -253,8 +295,8 @@ export class DemoStore {
  * end-of-match player list. A final side alone cannot prove the starting side,
  * so it is only used through a mapping learned from players we did observe.
  */
-export function buildRoster(spawns, playerInfo) {
-  const identities = new Map();
+export function buildRoster(spawns: readonly Row[], playerInfo: unknown): RosterEntry[] {
+  const identities = new Map<string, Identity>();
   for (const event of spawns) {
     if (event.is_warmup_period === true) continue;
     const steamid = str(event.user_steamid);
@@ -274,28 +316,30 @@ export function buildRoster(spawns, playerInfo) {
     }
   }
 
-  const finalSide = new Map();
-  for (const player of Array.isArray(playerInfo) ? playerInfo : []) {
-    const steamid = str(player?.steamid);
+  const finalSide = new Map<string, SideNumber>();
+  const info = Array.isArray(playerInfo) ? (playerInfo as Row[]) : [];
+  for (const player of info) {
+    const steamid = str(player.steamid);
     if (steamid === undefined) continue;
-    const teamNumber = num(player?.team_number);
+    const teamNumber = num(player.team_number);
     if (teamNumber === 2 || teamNumber === 3) finalSide.set(steamid, teamNumber);
-    if (!identities.has(steamid)) {
+    const existing = identities.get(steamid);
+    if (existing === undefined) {
       identities.set(steamid, {
-        name: str(player?.name) ?? '',
+        name: str(player.name) ?? '',
         steamid,
         tick: Number.MAX_SAFE_INTEGER,
         teamNumber: undefined,
         source: 'final',
       });
-    } else if (identities.get(steamid).name === '') {
-      identities.get(steamid).name = str(player?.name) ?? '';
+    } else if (existing.name === '') {
+      existing.name = str(player.name) ?? '';
     }
   }
 
   // final side -> initial side, only while every observation agrees
-  const finalToInitial = new Map();
-  const initialToFinal = new Map();
+  const finalToInitial = new Map<SideNumber, SideNumber>();
+  const initialToFinal = new Map<SideNumber, SideNumber>();
   for (const identity of identities.values()) {
     const final = finalSide.get(identity.steamid);
     if (final === undefined || identity.teamNumber === undefined) continue;
@@ -311,7 +355,7 @@ export function buildRoster(spawns, playerInfo) {
     initialToFinal.set(identity.teamNumber, final);
   }
 
-  const roster = [];
+  const roster: RosterEntry[] = [];
   for (const identity of identities.values()) {
     let teamNumber = identity.teamNumber;
     let source = identity.source;
@@ -333,10 +377,8 @@ export function buildRoster(spawns, playerInfo) {
     });
   }
 
-  roster.sort((left, right) => {
-    const rank = (team) => (team === 'A' ? 0 : team === 'B' ? 1 : 2);
-    return rank(left.stable_team) - rank(right.stable_team)
-      || (left.name ?? '').localeCompare(right.name ?? '');
-  });
+  const rank = (team: StableTeam | string | null): number => (team === 'A' ? 0 : team === 'B' ? 1 : 2);
+  roster.sort((left, right) => rank(left.stable_team) - rank(right.stable_team)
+    || (left.name ?? '').localeCompare(right.name ?? ''));
   return roster;
 }

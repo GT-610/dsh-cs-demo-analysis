@@ -1,6 +1,9 @@
 /** Small, dependency-free helpers shared by the tools and the analysis layer. */
 
-export function num(value) {
+import type { Row, SideName, SideNumber, StableTeam } from './types.ts';
+
+/** Coerce a loosely typed demo value into a finite number. */
+export function num(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value === 'bigint') return Number(value);
   if (typeof value === 'string' && value.trim() !== '') {
@@ -10,29 +13,32 @@ export function num(value) {
   return undefined;
 }
 
-export function str(value) {
+/** Coerce a loosely typed demo value into a string. */
+export function str(value: unknown): string | undefined {
   if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'bigint') return String(value);
   return undefined;
 }
 
-export function roundOf(event) {
-  const round = num(event?.total_rounds_played);
+export function roundOf(event: Row): number | undefined {
+  const round = num(event.total_rounds_played);
   return round === undefined ? undefined : Math.trunc(round);
 }
 
-export function isWarmup(event) {
-  return event?.is_warmup_period === true;
+export function isWarmup(event: Row): boolean {
+  return event.is_warmup_period === true;
 }
 
-export function clampInt(value, low, high, fallback) {
+export function clampInt(value: unknown, low: number, high: number, fallback: number): number;
+export function clampInt(value: unknown, low: number, high: number, fallback?: undefined): number | undefined;
+export function clampInt(value: unknown, low: number, high: number, fallback?: number): number | undefined {
   const parsed = num(value);
   if (parsed === undefined) return fallback;
   return Math.min(high, Math.max(low, Math.trunc(parsed)));
 }
 
 /** Indices of `count` items sampled evenly, always including first and last. */
-export function equidistantIndices(count, limit) {
+export function equidistantIndices(count: number, limit: number): number[] {
   if (limit <= 0 || count <= 0) return [];
   if (limit >= count) return Array.from({ length: count }, (_, index) => index);
   if (limit === 1) return [0];
@@ -41,40 +47,40 @@ export function equidistantIndices(count, limit) {
 }
 
 /** Bound an array to `limit` rows by even sampling; reports whether it sampled. */
-export function sampleRows(rows, limit) {
+export function sampleRows<T>(rows: readonly T[], limit: number): { rows: T[]; total: number; sampled: boolean } {
   const total = rows.length;
-  if (limit >= total) return { rows, total, sampled: false };
+  if (limit >= total) return { rows: [...rows], total, sampled: false };
   const picked = equidistantIndices(total, limit)
     .map((index) => rows[index])
-    .filter((row) => row !== undefined);
+    .filter((row): row is T => row !== undefined);
   return { rows: picked, total, sampled: true };
 }
 
 /** Team number 3 is CT, 2 is T. Team A is the roster that starts CT. */
-export function stableTeam(teamNumber) {
+export function stableTeam(teamNumber: unknown): StableTeam | undefined {
   if (teamNumber === 3) return 'A';
   if (teamNumber === 2) return 'B';
   return undefined;
 }
 
-export function sideLabel(teamNumber) {
+export function sideLabel(teamNumber: unknown): SideName | undefined {
   if (teamNumber === 3) return 'CT';
   if (teamNumber === 2) return 'T';
   return undefined;
 }
 
-export function stableTeamRank(teamNumber) {
-  if (teamNumber === 3) return 0;
-  if (teamNumber === 2) return 1;
+export function stableTeamRank(teamNumber: SideNumber | StableTeam | null | undefined): number {
+  if (teamNumber === 3 || teamNumber === 'A') return 0;
+  if (teamNumber === 2 || teamNumber === 'B') return 1;
   return 2;
 }
 
 /** Deduplicate while keeping first-seen order. */
-export function unique(items) {
+export function unique<T>(items: readonly T[]): T[] {
   return [...new Set(items)];
 }
 
-export function formatBytes(bytes) {
+export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes)) return 'unknown';
   const units = ['B', 'KB', 'MB', 'GB'];
   let value = bytes;
@@ -99,8 +105,8 @@ const PISTOLS = new Set([
   'Five-SeveN', 'Tec-9', 'CZ75-Auto', 'Dual Berettas',
 ]);
 
-function weaponRank(weapon) {
-  const name = String(weapon ?? '');
+function weaponRank(weapon: string): number {
+  const name = weapon;
   if (name === 'AWP') return 5;
   if (PRIMARY_WEAPONS.has(name)) return 4;
   if (SECONDARY_LONG.has(name)) return 3;
@@ -113,15 +119,17 @@ function weaponRank(weapon) {
  * is whatever is in hand (knife, grenade, bomb), so it is a poor proxy for the
  * player's actual equipment.
  */
-export function bestWeapon(inventory) {
+export function bestWeapon(inventory: unknown): string | null {
   if (!Array.isArray(inventory)) return null;
-  let best = null;
+  let best: string | null = null;
   let bestRank = 0;
   for (const weapon of inventory) {
-    const rank = weaponRank(weapon);
+    const name = str(weapon);
+    if (name === undefined) continue;
+    const rank = weaponRank(name);
     if (rank > bestRank) {
       bestRank = rank;
-      best = weapon;
+      best = name;
     }
   }
   return best;

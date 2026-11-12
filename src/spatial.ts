@@ -1,11 +1,21 @@
 /** Round windows, tick sampling, and spatial aggregation for position evidence. */
 
-import { num } from './util.js';
+import type { PositionRow, RosterEntry, RoundTickWindow, StableTeam } from './types.ts';
+import { num, str } from './util.ts';
 
 export const TICK_RATE = 64;
 
+/** A round's live-play tick window. */
+export interface RoundWindow {
+  round: number;
+  start: number;
+  freeze: number | null | undefined;
+  end: number;
+  liveStart: number;
+}
+
 /** Build per-round [start, freeze-end, end] tick windows from the round model. */
-export function buildRoundWindows(rounds) {
+export function buildRoundWindows(rounds: readonly RoundTickWindow[]): RoundWindow[] {
   return rounds.map((round) => ({
     round: round.round,
     start: round.start_tick,
@@ -19,16 +29,16 @@ export function buildRoundWindows(rounds) {
  * Evenly sample ticks inside the live portion of each window.
  * Doubles the stride until the total fits `maxTicks`.
  */
-export function sampleWindowTicks(windows, stepSeconds, maxTicks = 5_000) {
+export function sampleWindowTicks(windows: readonly RoundWindow[], stepSeconds: number, maxTicks = 5_000): { ticks: number[]; step: number } {
   let step = Math.max(1, Math.round(stepSeconds * TICK_RATE));
-  const estimate = (stride) => windows.reduce((sum, window) => {
+  const estimate = (stride: number): number => windows.reduce((sum, window) => {
     const span = window.end - 64 - window.liveStart;
     return sum + (span <= 0 ? 0 : Math.floor(span / stride) + 1);
   }, 0);
 
   while (estimate(step) > maxTicks && step < 64 * 60) step *= 2;
 
-  const ticks = [];
+  const ticks: number[] = [];
   for (const window of windows) {
     const last = window.end - 64;
     for (let tick = window.liveStart; tick <= last; tick += step) ticks.push(tick);
@@ -38,14 +48,16 @@ export function sampleWindowTicks(windows, stepSeconds, maxTicks = 5_000) {
 }
 
 /** Map a tick to the display round whose live window contains it. */
-export function roundForTick(tick, windows) {
+export function roundForTick(tick: number, windows: readonly RoundWindow[]): number | undefined {
   let low = 0;
   let high = windows.length - 1;
-  let candidate;
+  let candidate: RoundWindow | undefined;
   while (low <= high) {
     const middle = (low + high) >> 1;
-    if (windows[middle].liveStart <= tick) {
-      candidate = windows[middle];
+    const window = windows[middle];
+    if (window === undefined) break;
+    if (window.liveStart <= tick) {
+      candidate = window;
       low = middle + 1;
     } else {
       high = middle - 1;
@@ -55,7 +67,14 @@ export function roundForTick(tick, windows) {
   return undefined;
 }
 
-function regionLabel(x, y, bounds) {
+interface Bounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+function regionLabel(x: number, y: number, bounds: Bounds): string {
   const width = bounds.maxX - bounds.minX || 1;
   const height = bounds.maxY - bounds.minY || 1;
   const nx = (x - bounds.minX) / width;
@@ -68,11 +87,52 @@ function regionLabel(x, y, bounds) {
   return `${vertical}-${horizontal}`;
 }
 
+interface PlaceAggregate {
+  samples: number;
+  bombZone: number;
+  teams: { A: number; B: number };
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  bombMinX: number;
+  bombMaxX: number;
+  bombMinY: number;
+  bombMaxY: number;
+}
+
+interface CellAggregate {
+  x: number;
+  y: number;
+  count: number;
+}
+
+/** One place in the bounded, share-annotated catalog. */
+export interface PlaceRow {
+  place: string;
+  samples: number;
+  share: number;
+  bomb_zone_samples: number;
+  teams: { A: number; B: number };
+  bounds: { min_x: number; max_x: number; min_y: number; max_y: number } | null;
+  bomb_target_bounds: { min_x: number; max_x: number; min_y: number; max_y: number } | null;
+}
+
+/** One heatmap cell. */
+export interface CellRow {
+  cell: number[];
+  x: number;
+  y: number;
+  samples: number;
+  share: number;
+  region: string;
+}
+
 /** Turn a place counter into a bounded, share-annotated list. */
-export function placeRows(counter, limit = 20) {
+export function placeRows(counter: Map<string, PlaceAggregate>, limit = 20): PlaceRow[] {
   const total = [...counter.values()].reduce((sum, entry) => sum + entry.samples, 0);
   return [...counter.entries()]
-    .map(([place, entry]) => ({
+    .map(([place, entry]): PlaceRow => ({
       place,
       samples: entry.samples,
       share: total === 0 ? 0 : Math.round((entry.samples / total) * 1000) / 10,
@@ -95,7 +155,7 @@ export function placeRows(counter, limit = 20) {
     .slice(0, limit);
 }
 
-function addPlace(map, place, team, x, y, bombZone) {
+function addPlace(map: Map<string, PlaceAggregate>, place: string, team: StableTeam | null, x: number, y: number, bombZone: boolean): PlaceAggregate {
   let entry = map.get(place);
   if (entry === undefined) {
     entry = {
@@ -129,18 +189,63 @@ function addPlace(map, place, team, x, y, bombZone) {
   return entry;
 }
 
+/** One player's spatial evidence. */
+export interface PlayerSpatial {
+  name: string;
+  steamid: string;
+  stable_team: StableTeam | null;
+  samples: number;
+  tiles_visited: number;
+  distance_units: number;
+  places: PlaceRow[];
+  top_cells: CellRow[];
+}
+
+/** One team's spatial evidence. */
+export interface TeamSpatial {
+  samples: number;
+  places: PlaceRow[];
+  top_cells: CellRow[];
+}
+
+/** The position tool payload. */
+export interface PositionReport {
+  players: PlayerSpatial[];
+  teams: { A: TeamSpatial | null; B: TeamSpatial | null };
+  places: PlaceRow[];
+  bounds: { min_x: number; max_x: number; min_y: number; max_y: number } | null;
+  rounds?: number[];
+  cell_units: number;
+  note: string;
+}
+
+interface PlayerTrack {
+  name: string;
+  steamid: string;
+  stable_team: StableTeam | null;
+  samples: number;
+  distance: number;
+  cells: Map<string, CellAggregate>;
+  places: Map<string, PlaceAggregate>;
+  last: { x: number; y: number; round: number } | undefined;
+}
+
 /**
  * Aggregate sampled position rows into per-player, per-team, and map-level
  * place evidence. Rows: { round, tick, steamid, name, team_num, x, y, place, bomb_zone }.
  */
-export function aggregatePositions(rows, roster, { cellUnits = 256, topCells = 12 } = {}) {
-  const rosterBySteam = new Map(roster.map((player) => [player.steamid, player]));
-  const bounds = { minX: Number.POSITIVE_INFINITY, maxX: Number.NEGATIVE_INFINITY, minY: Number.POSITIVE_INFINITY, maxY: Number.NEGATIVE_INFINITY };
-  const players = new Map();
-  const mapPlaces = new Map();
-  const teamCells = { A: new Map(), B: new Map() };
-  const teamPlaces = { A: new Map(), B: new Map() };
-  const roundSet = new Set();
+export function aggregatePositions(
+  rows: readonly PositionRow[],
+  roster: readonly RosterEntry[],
+  { cellUnits = 256, topCells = 12 }: { cellUnits?: number; topCells?: number } = {},
+): PositionReport {
+  const rosterBySteam = new Map(roster.map((player): [string, RosterEntry] => [player.steamid, player]));
+  const bounds: Bounds = { minX: Number.POSITIVE_INFINITY, maxX: Number.NEGATIVE_INFINITY, minY: Number.POSITIVE_INFINITY, maxY: Number.NEGATIVE_INFINITY };
+  const players = new Map<string, PlayerTrack>();
+  const mapPlaces = new Map<string, PlaceAggregate>();
+  const teamCells: { A: Map<string, CellAggregate>; B: Map<string, CellAggregate> } = { A: new Map(), B: new Map() };
+  const teamPlaces: { A: Map<string, PlaceAggregate>; B: Map<string, PlaceAggregate> } = { A: new Map(), B: new Map() };
+  const roundSet = new Set<number>();
 
   for (const row of rows) {
     const x = num(row.x);
@@ -159,13 +264,13 @@ export function aggregatePositions(rows, roster, { cellUnits = 256, topCells = 1
     addPlace(mapPlaces, place, stable, x, y, bombZone);
 
     const player = players.get(row.steamid) ?? {
-      name: rosterBySteam.get(row.steamid)?.name ?? row.name ?? row.steamid,
+      name: str(rosterBySteam.get(row.steamid)?.name) ?? str(row.name) ?? row.steamid,
       steamid: row.steamid,
       stable_team: stable,
       samples: 0,
       distance: 0,
-      cells: new Map(),
-      places: new Map(),
+      cells: new Map<string, CellAggregate>(),
+      places: new Map<string, PlaceAggregate>(),
       last: undefined,
     };
     players.set(row.steamid, player);
@@ -199,8 +304,8 @@ export function aggregatePositions(rows, roster, { cellUnits = 256, topCells = 1
     return { players: [], teams: { A: null, B: null }, places: [], bounds: null, cell_units: cellUnits, note: 'no position samples' };
   }
 
-  const toCells = (map, samples) => [...map.entries()]
-    .map(([key, cell]) => {
+  const toCells = (map: Map<string, CellAggregate>, samples: number): CellRow[] => [...map.entries()]
+    .map(([key, cell]): CellRow => {
       const x = cell.x / cell.count;
       const y = cell.y / cell.count;
       return {
@@ -215,7 +320,7 @@ export function aggregatePositions(rows, roster, { cellUnits = 256, topCells = 1
     .sort((left, right) => right.samples - left.samples)
     .slice(0, topCells);
 
-  const playerRows = [...players.values()].map((player) => ({
+  const playerRows: PlayerSpatial[] = [...players.values()].map((player) => ({
     name: player.name,
     steamid: player.steamid,
     stable_team: player.stable_team,
@@ -226,7 +331,7 @@ export function aggregatePositions(rows, roster, { cellUnits = 256, topCells = 1
     top_cells: toCells(player.cells, player.samples),
   })).sort((left, right) => right.samples - left.samples);
 
-  const teamSamples = (team) => [...teamPlaces[team].values()].reduce((sum, entry) => sum + entry.samples, 0);
+  const teamSamples = (team: StableTeam): number => [...teamPlaces[team].values()].reduce((sum, entry) => sum + entry.samples, 0);
 
   return {
     players: playerRows,
