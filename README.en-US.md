@@ -16,13 +16,13 @@ A Counter-Strike 2 demo review mode for DeepSeek Harness. It keeps the full stan
 ## Requirements
 
 - DeepSeek Harness Desktop, or a `dsh` profile that can install bundles.
-- Node.js 20 or newer.
+- Node.js 22.19 or newer (the sources are TypeScript; tests run the `.ts` files directly).
 - A Counter-Strike 2 (Source 2) demo. CS:GO demos are not supported.
 - macOS arm64/x64, Windows x64, or Linux x64/arm64 (`@laihoe/demoparser2` publishes prebuilds).
 
 ## Install
 
-1. Install dependencies in this directory:
+1. Install dependencies in this directory. The `prepare` hook also builds `src/*.ts` into `dist/`:
 
    ```bash
    npm install
@@ -97,14 +97,17 @@ CS2 demos carry `m_szLastPlaceName`, the game's callout for the player's current
 
 ## Architecture
 
-- `src/parse-worker.js`: N-API parsing on a worker thread; grenades are aggregated before crossing the boundary.
-- `src/parser.js`: restartable main-thread client with per-call timeouts and cancellation.
-- `src/demo-store.js`: workspace path resolution, `PBDEMS2` validation, per-file-revision caches for header/roster/events.
-- `src/analysis.js`: round windows, economy, player and utility statistics.
-- `src/spatial.js`: round windows, tick sampling, place/cell aggregation.
-- `src/tools.js`: model-facing tools and bounds.
-- `src/plugin.js`: preset mount point and runtime skill registration.
+- `src/parse-worker.ts`: N-API parsing on a worker thread; grenades are aggregated before crossing the boundary.
+- `src/parser.ts`: restartable main-thread client with per-call timeouts and cancellation.
+- `src/demo-store.ts`: workspace path resolution, `PBDEMS2` validation, per-file-revision caches for header/roster/events.
+- `src/analysis.ts`: round windows, economy, player and utility statistics.
+- `src/spatial.ts`: round windows, tick sampling, place/cell aggregation.
+- `src/tools.ts`: model-facing tools and bounds.
+- `src/plugin.ts`: preset mount point and runtime skill registration.
+- `src/types.ts`, `src/worker-protocol.ts`: domain types and the worker RPC contract.
 - `skills/cs2-review/SKILL.md`: review workflow, metric definitions, and report template.
+
+`src/` is TypeScript source; `dist/` is the build output (two entries, `plugin.js` and `parse-worker.js`) and is what `exports` points at.
 
 Every row-returning tool samples evenly, caps serialized size, and reports `truncated` / `sampled`.
 
@@ -112,8 +115,13 @@ Every row-returning tool samples evenly, caps serialized size, and reports `trun
 
 ```bash
 npm install
-npm test
+npm run typecheck   # tsc --noEmit
+npm run build       # tsdown, emits dist/
+npm run dev         # tsdown --watch, rebuilds on edit
+npm test            # node --test, runs the .ts sources directly
 ```
+
+`npm test` relies on Node 22.18+ type stripping to execute TypeScript without a build step; `npm run build` is only needed for the packaged plugin that the Harness loads.
 
 Without environment variables only unit tests run. To run integration coverage against a real demo:
 
